@@ -1,4 +1,4 @@
-# app.py — Streamlit 리뷰 예측 데모 (joblib/pkl만 사용)
+# app.py — Streamlit 리뷰 예측 데모 (skops 먼저, 없으면 joblib)
 
 import os, re
 from pathlib import Path
@@ -8,6 +8,34 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# ---- skops 옵션 로드(있으면 사용) ----
+try:
+    from skops.io import load as skops_load, get_untrusted_types
+    HAS_SKOPS = True
+except Exception:
+    HAS_SKOPS = False
+
+ALLOWED_PREFIXES = ("sklearn.", "numpy.", "scipy.", "xgboost.", "lightgbm.")
+
+def safe_skops_load(path: Path):
+    """
+    skops 0.10+ 보안모드: 파일 내 타입을 검사하고 trusted 목록으로 로드
+    """
+    if not HAS_SKOPS:
+        raise RuntimeError("skops 미설치")
+    p = str(path)
+    # 서로 다른 시그니처 대응
+    try:
+        types = get_untrusted_types(file=p)
+    except TypeError:
+        try:
+            types = get_untrusted_types(path=p)
+        except TypeError:
+            types = get_untrusted_types()
+    bad = [t for t in types if not t.startswith(ALLOWED_PREFIXES)]
+    if bad:
+        raise RuntimeError(f"허용되지 않은 타입 감지: {bad[:5]}")
+    return skops_load(p, trusted=types)
 
 # =========================
 #  전처리 & 토크나이즈
@@ -36,20 +64,18 @@ def clean_text(s: str) -> str:
     return s
 
 def tokenize_and_join(s: str) -> str:
-    # 간단 토크나이저 (두 글자 이상 영/숫/한글만)
+    # 두 글자 이상 영/숫/한글 토큰만
     return " ".join(re.findall(r"[가-힣A-Za-z0-9]{2,}", clean_text(s)))
-
 
 # =========================
 #  모델 경로 선택 & 로드
 # =========================
 def _pick_models_dir() -> Path:
-    """여러 후보 중 존재하는 models 폴더를 선택"""
     here = Path(__file__).resolve().parent
     candidates = [
-        here / "models",                # 권장: repo 루트/app.py와 같은 레벨
-        Path("./models").resolve(),     # 작업 디렉토리 기준
-        Path(os.getcwd()) / "models",   # CWD 기준
+        here / "models",                # 권장
+        Path("./models").resolve(),
+        Path(os.getcwd()) / "models",
     ]
     for p in candidates:
         if p.exists():
@@ -57,7 +83,7 @@ def _pick_models_dir() -> Path:
     return candidates[0]
 
 def _patch_rf_monotonic(reg):
-    """sklearn 1.3 → 1.6 예전 joblib 복원 시 발생하는 monotonic_cst 호환 패치"""
+    """sklearn 1.3→1.6 호환 패치 (DecisionTreeRegressor.monotonic_cst)"""
     try:
         from sklearn.ensemble import RandomForestRegressor
         from sklearn.pipeline import Pipeline
@@ -76,43 +102,54 @@ def _patch_rf_monotonic(reg):
         pass
     return reg
 
+def _load_one(base: Path, stem: str):
+    """
+    같은 이름의 .skops가 있으면 skops로, 아니면 joblib로 로드
+    stem: 파일 앞부분(ex. 'tfidf_vectorizer', 'sgd_logistic_cls', 'rf_reg')
+    """
+    sk = base / f"{stem}.skops"
+    jl = base / f"{stem}.joblib"
+    pkl = base / f"{stem}.pkl"
+
+    if sk.exists() and HAS_SKOPS:
+        return safe_skops_load(sk)
+    if jl.exists():
+        return joblib.load(jl)
+    if pkl.exists():
+        return joblib.load(pkl)
+    raise FileNotFoundError(f"{stem}(.skops|.joblib|.pkl) 파일이 없습니다.")
 
 @st.cache_resource(show_spinner=True)
 def load_models():
     BASE = _pick_models_dir()
 
-    # 디버그 정보(배포 시 경로 문제 확인용)
+    # 배포 경로 디버그(문제시 바로 확인)
     st.write("🔎 CWD:", os.getcwd())
     st.write("📁 BASE(models):", str(BASE))
     try:
-        st.write("📄 models contents:", [p.name for p in BASE.glob("*")])
+        st.write("📄 models contents:", sorted(p.name for p in BASE.glob("*")))
     except Exception:
         pass
 
-    VEC_PKL = BASE / "tfidf_vectorizer.pkl"
-    CLS_JBL = BASE / "sgd_logistic_cls.joblib"
-    REG_JBL = BASE / "rf_reg.joblib"
-
-    missing = [p.name for p in [VEC_PKL, CLS_JBL, REG_JBL] if not p.exists()]
-    if missing:
+    try:
+        vectorizer = _load_one(BASE, "tfidf_vectorizer")
+        cls        = _load_one(BASE, "sgd_logistic_cls")
+        reg        = _load_one(BASE, "rf_reg")
+    except FileNotFoundError as e:
         st.error(
             "모델 파일을 찾을 수 없습니다.\n\n"
             f"- 찾은 BASE 폴더: {BASE}\n"
             f"- BASE 목록: {[p.name for p in BASE.glob('*')]}\n"
-            f"- 누락 파일: {missing}\n\n"
-            "👉 리포지토리 루트에 `models/` 폴더를 두고 다음 3개 파일명이 정확히 일치하는지 확인하세요.\n"
-            "   • tfidf_vectorizer.pkl\n"
-            "   • sgd_logistic_cls.joblib\n"
-            "   • rf_reg.joblib\n"
+            f"- 에러: {e}\n\n"
+            "👉 리포지토리 루트에 `models/` 폴더를 두고 다음 파일들 중 하나 형식으로 준비하세요.\n"
+            "   • tfidf_vectorizer.(skops|pkl)\n"
+            "   • sgd_logistic_cls.(skops|joblib)\n"
+            "   • rf_reg.(skops|joblib)\n"
         )
         st.stop()
 
-    vectorizer = joblib.load(VEC_PKL)
-    cls        = joblib.load(CLS_JBL)
-    reg        = joblib.load(REG_JBL)
-    reg        = _patch_rf_monotonic(reg)
+    reg = _patch_rf_monotonic(reg)
     return vectorizer, cls, reg
-
 
 # =========================
 #  Streamlit UI
@@ -129,8 +166,8 @@ if st.button("예측하기") and inp.strip():
     toks = tokenize_and_join(inp)
     X = vec.transform([toks])
 
-    cls_star = int(cls.predict(X)[0])                 # 분류(정수)
-    reg_star = float(np.clip(reg.predict(X)[0], 1, 5))# 회귀(연속 1~5 클립)
+    cls_star = int(cls.predict(X)[0])                   # 분류(정수)
+    reg_star = float(np.clip(reg.predict(X)[0], 1, 5))  # 회귀(연속, 1~5 클립)
 
     c1, c2 = st.columns(2)
     with c1: st.metric("분류(정수)", f"{cls_star} ★")
