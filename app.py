@@ -1,4 +1,4 @@
-# app.py
+# app.py — Streamlit 리뷰 예측(회귀 전용)
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -10,54 +10,26 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---- (선택) skops: 있으면 우선 사용 ----
-try:
-    from skops.io import load as skops_load, get_untrusted_types
-    HAS_SKOPS = True
-except Exception:
-    HAS_SKOPS = False
-
-ALLOWED_PREFIXES = ("sklearn.", "numpy.", "scipy.", "xgboost.", "lightgbm.")
-
-def safe_skops_load(path: Path):
-    if not HAS_SKOPS:
-        raise RuntimeError("skops 미설치")
-    p = str(path)
-    try:
-        types = get_untrusted_types(file=p)
-    except TypeError:
-        try:
-            types = get_untrusted_types(path=p)
-        except TypeError:
-            types = get_untrusted_types()
-    # 보안: 우리가 쓸 가능성이 있는 모듈만 허용
-    _ = [t for t in types if t.startswith(ALLOWED_PREFIXES)]
-    return skops_load(p, trusted=types)
-
-# -------------------- 기본 설정 --------------------
+# =========================
+# 기본 설정
+# =========================
 st.set_page_config(page_title="리뷰 예측/분석", page_icon="⭐", layout="wide")
 
-# -------------------- 모델 경로 --------------------
 ROOT = Path(__file__).resolve().parent
 MODELS = ROOT / "models"
 
-VEC_SKOPS = MODELS / "tfidf_vectorizer.skops"
-VEC_PKL   = MODELS / "tfidf_vectorizer.pkl"
-REG_SKOPS = MODELS / "rf_reg.skops"
-REG_JBL   = MODELS / "rf_reg.joblib"
+VEC_PKL = MODELS / "tfidf_vectorizer.pkl"
+REG_JOBLIB = MODELS / "rf_reg.joblib"
 
-def _assert_files_exist():
-    have_vec = VEC_SKOPS.exists() or VEC_PKL.exists()
-    have_reg = REG_SKOPS.exists() or REG_JBL.exists()
-    if not (have_vec and have_reg):
-        st.error(
-            "모델 파일 누락입니다. models/ 폴더에 다음 중 하나씩은 있어야 합니다.\n\n"
-            "• tfidf_vectorizer.(skops | pkl)\n"
-            "• rf_reg.(skops | joblib)\n"
-        )
+def _assert_files_exist(paths):
+    miss = [p for p in paths if not p.exists()]
+    if miss:
+        st.error(f"모델 파일 누락: {[str(p) for p in miss]}")
         st.stop()
 
-# -------------------- 전처리/토크나이즈 --------------------
+# =========================
+# 전처리/토크나이즈
+# =========================
 POS_EMO = "😀😃😄😁😆🙂😊😍🤩😋😉👍🙌🎉❤💖💗💓💞💕✨😻🥰🤗😺😸"
 NEG_EMO = "😞😟😠😡😢😭🤮😒😕🙁☹👎💢😣😖🤬😤💔😿😹"
 URL_RE = re.compile(r"(https?:\/\/[^\s]+)")
@@ -84,7 +56,9 @@ def _clean_text(s: str) -> str:
 def tokenize_and_join(s: str) -> str:
     return " ".join(re.findall(r"[가-힣A-Za-z0-9]{2,}", _clean_text(s)))
 
-# -------------------- 호환 패치: RF monotonic_cst --------------------
+# =========================
+# 호환 패치 (RF)
+# =========================
 def _patch_rf_monotonic(reg_model):
     try:
         from sklearn.ensemble import RandomForestRegressor
@@ -104,46 +78,57 @@ def _patch_rf_monotonic(reg_model):
         pass
     return reg_model
 
-# -------------------- 모델 로더 (캐시) --------------------
+# =========================
+# 모델 로드 (캐시)
+# =========================
 @st.cache_resource(show_spinner=True)
 def load_models():
-    _assert_files_exist()
-
-    # 벡터라이저
-    if VEC_SKOPS.exists() and HAS_SKOPS:
-        vectorizer = safe_skops_load(VEC_SKOPS)
-    else:
-        vectorizer = joblib.load(VEC_PKL)
-
-    # 회귀 모델
-    if REG_SKOPS.exists() and HAS_SKOPS:
-        reg = safe_skops_load(REG_SKOPS)
-    else:
-        reg = joblib.load(REG_JBL)
-
+    _assert_files_exist([VEC_PKL, REG_JOBLIB])
+    vec = joblib.load(VEC_PKL)
+    reg = joblib.load(REG_JOBLIB)
     reg = _patch_rf_monotonic(reg)
-    return vectorizer, reg
+    return vec, reg
+
+# =========================
+# 위험도 판정
+# =========================
+def risk_level(avg_score: float) -> str:
+    # Safe ≥ 4.10, Low ≥ 4.00, Medium ≥ 3.90, High < 3.90
+    if avg_score >= 4.10:
+        return "Safe"
+    if avg_score >= 4.00:
+        return "Low"
+    if avg_score >= 3.90:
+        return "Medium"
+    return "High"
+
+def risk_color(level: str) -> str:
+    return {
+        "Safe":   "#2e7d32",
+        "Low":    "#558b2f",
+        "Medium": "#f9a825",
+        "High":   "#c62828",
+    }.get(level, "#333333")
 
 # ==========================================================
-#                           UI
+#                          UI
 # ==========================================================
 st.title("⭐ 리뷰 예측 데모")
+
 vec, reg = load_models()
 
-# ---------------- 단일 예측 ----------------
+# ── 단일 예측
 st.subheader("단일 텍스트 예측")
 inp = st.text_area("리뷰 텍스트 입력", height=160, placeholder="리뷰를 붙여넣으세요…")
-
 if st.button("예측하기") and inp.strip():
     toks = tokenize_and_join(inp)
     X = vec.transform([toks])
-
-    pred_score = float(np.clip(reg.predict(X)[0], 1, 5))  # 1~5 범위로 클립
-    st.metric("예측 점수", f"{pred_score:.2f} ★")
+    score = float(np.clip(reg.predict(X)[0], 1, 5))  # 1~5로 클립
+    st.metric("예측 점수", f"{score:.2f} ★")
 
 st.divider()
 
-# ---------------- 배치 예측 ----------------
+# ── 배치 예측
 st.subheader("배치 예측 (CSV 업로드)")
 csv = st.file_uploader("CSV 업로드 (필수 컬럼: review_text)", type=["csv"])
 
@@ -156,11 +141,48 @@ if csv is not None:
         if "review_text" not in df.columns:
             st.error("CSV에 'review_text' 컬럼이 없습니다.")
         else:
+            # 예측
             toks = df["review_text"].fillna("").astype(str).map(tokenize_and_join)
             X = vec.transform(toks)
             df["pred_score"] = np.clip(reg.predict(X), 1, 5).round(2)
 
-            st.dataframe(df.head(50), use_container_width=True)
+            # 화면 표시용 컬럼 구성 (query는 숨김)
+            view_cols = []
+            if "review_text" in df.columns:
+                view_cols.append("review_text")
+            if "review_date" in df.columns:
+                view_cols.append("review_date")
+            view_cols.append("pred_score")
+
+            df_view = df.loc[:, view_cols].rename(
+                columns={
+                    "review_text": "리뷰",
+                    "review_date": "날짜",
+                    "pred_score":  "예측 별점",
+                }
+            )
+
+            st.dataframe(df_view, use_container_width=True)
+
+            # ===== 평균 & 위험도 =====
+            avg = float(df["pred_score"].mean())
+            level = risk_level(avg)
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                st.metric("나의 평균 평점", f"{avg:.2f} ★")
+            with col2:
+                st.markdown(
+                    f"""
+                    <div style="padding:10px 12px;border-radius:10px;
+                                background:{risk_color(level)};color:#fff;
+                                display:inline-block;font-weight:600;">
+                        위험도: {level}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            # ===== 다운로드 =====
             st.download_button(
                 "결과 CSV 다운로드",
                 df.to_csv(index=False, encoding="utf-8-sig"),
