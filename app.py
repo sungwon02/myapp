@@ -1,35 +1,32 @@
-# app.py — Streamlit 리뷰 예측(스크립트와 정합, RF예측 + SGD설명)
+# app.py — Streamlit 리뷰 예측( predict_safe.py 동치화 버전 )
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import re, json
+import os, re, json
 from pathlib import Path
-from collections import defaultdict
 
+import joblib
 import numpy as np
 import pandas as pd
-import streamlit as st
-import joblib
 from scipy.sparse import csr_matrix
+import streamlit as st
 
-# ============= 기본 UI =============
-st.set_page_config(page_title="리뷰 예측/분석", page_icon="⭐", layout="wide")
-st.title("⭐ 리뷰 예측")
+# ---------- 공통: 스레드/백엔드 제한 ----------
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-ROOT   = Path(__file__).resolve().parent
-MODELS = ROOT / "models"
-
-ALLOWED_PREFIXES = ("sklearn.", "numpy.", "scipy.", "xgboost.", "lightgbm.")
-
-# ============= skops 안전 로더 =============
+# skops 안전 로더
 try:
     from skops.io import load as skops_load, get_untrusted_types
     HAS_SKOPS = True
 except Exception:
     HAS_SKOPS = False
 
+ALLOWED_PREFIXES = ("sklearn.", "numpy.", "scipy.", "xgboost.", "lightgbm.")
+
 def safe_skops_load(path: Path):
     p = str(path)
-    types = None
     try:
         types = get_untrusted_types(file=p)
     except TypeError:
@@ -39,62 +36,35 @@ def safe_skops_load(path: Path):
             types = get_untrusted_types()
     bad = [t for t in types if not t.startswith(ALLOWED_PREFIXES)]
     if bad:
-        raise RuntimeError(f"비허용 타입 포함: {bad[:5]} in {p}")
+        raise RuntimeError(f"skops 파일 비허용 타입 포함: {bad[:5]} ...")
     return skops_load(p, trusted=types)
 
-def _patch_rf_monotonic(reg_pipeline):
+# ---------- RF 하위 추정기 패치 ----------
+def patch_rf_monotonic(reg):
     try:
         from sklearn.ensemble import RandomForestRegressor
         from sklearn.pipeline import Pipeline
         rf = None
-        if isinstance(reg_pipeline, Pipeline):
-            last = reg_pipeline.steps[-1][1]
+        if "Pipeline" in str(type(reg)):
+            last = reg.steps[-1][1]
             if isinstance(last, RandomForestRegressor):
                 rf = last
-        elif isinstance(reg_pipeline, RandomForestRegressor):
-            rf = reg_pipeline
-        if rf is None or getattr(rf, "estimators_", None) is None:
-            return reg_pipeline
-        for est in rf.estimators_:
-            if not hasattr(est, "monotonic_cst"):
-                setattr(est, "monotonic_cst", None)
+        elif isinstance(reg, RandomForestRegressor):
+            rf = reg
+        if rf is not None and getattr(rf, "estimators_", None) is not None:
+            for est in rf.estimators_:
+                if not hasattr(est, "monotonic_cst"):
+                    setattr(est, "monotonic_cst", None)
     except Exception:
         pass
-    return reg_pipeline
+    return reg
 
-def load_vectorizer_with_compat(base: Path, model_expected_n: int | None):
-    cands = []
-    sk = base / "tfidf_vectorizer.skops"
-    pk = base / "tfidf_vectorizer.pkl"
-    if sk.exists() and HAS_SKOPS:
-        cands.append(("skops", sk))
-    if pk.exists():
-        cands.append(("pkl", pk))
-    if not cands:
-        raise FileNotFoundError("tfidf_vectorizer.(skops|pkl) 없음")
-
-    last_err, chosen = None, None
-    for kind, path in cands:
-        try:
-            vec = safe_skops_load(path) if kind == "skops" else joblib.load(path)
-            n_vec = len(vec.get_feature_names_out())
-            if (model_expected_n is None) or (n_vec == model_expected_n):
-                chosen = vec
-                break
-            else:
-                last_err = f"{path.name}: {n_vec} vs expected {model_expected_n}"
-        except Exception as e:
-            last_err = f"load fail {path.name}: {e!r}"
-    if chosen is None:
-        raise ValueError(f"호환 벡터라이저 없음. 마지막 오류: {last_err}")
-    return chosen
-
-# ============= 토크나이즈/정규화 (스크립트 동일) =============
+# ---------- 텍스트 정제/토크나이즈 ----------
 POS_EMO = "😀😃😄😁😆🙂😊😍🤩😋😉👍🙌🎉❤💖💗💓💞💕✨😻🥰🤗😺😸"
 NEG_EMO = "😞😟😠😡😢😭🤮😒😕🙁☹👎💢😣😖🤬😤💔😿😹"
-URL_RE   = re.compile(r"(https?:\/\/[^\s]+)")
-HTML_RE  = re.compile(r"<[^>]+>")
-MULTI_S  = re.compile(r"\s+")
+URL_RE = re.compile(r"(https?:\/\/[^\s]+)")
+HTML_RE = re.compile(r"<[^>]+>")
+MULTI_SPACE = re.compile(r"\s+")
 
 def replace_emojis(text: str) -> str:
     text = re.sub(f"[{re.escape(POS_EMO)}]+", " [EMO_POS] ", text)
@@ -110,7 +80,7 @@ def clean_text(s: str) -> str:
     s = URL_RE.sub(" [URL] ", s)
     s = replace_emojis(s)
     s = re.sub(r"[^0-9A-Za-z가-힣\.\,\!\?\[\]_ ]+", " ", s)
-    s = MULTI_S.sub(" ", s).strip()
+    s = MULTI_SPACE.sub(" ", s).strip()
     return s
 
 def get_tokenizer():
@@ -119,7 +89,8 @@ def get_tokenizer():
         from mecab import MeCab
         m = MeCab()
         def tok(text):
-            return [w for (w, p) in m.pos(text) if p.startswith(("NN","VV","VA","MAG","IC","XR"))]
+            return [w for (w, p) in m.pos(text)
+                    if p.startswith(("NN","VV","VA","MAG","IC","XR"))]
         return "mecab_python", tok
     except Exception:
         pass
@@ -128,11 +99,12 @@ def get_tokenizer():
         from kiwipiepy import Kiwi
         kiwi = Kiwi()
         def tok(text):
-            return [t.form for t in kiwi.tokenize(text) if t.tag.startswith(("N","V","MAG","IC","XR","MM"))]
+            return [t.form for t in kiwi.tokenize(text)
+                    if t.tag.startswith(("N","V","MAG","IC","XR","MM"))]
         return "kiwi", tok
     except Exception:
         pass
-    # 3) fallback
+    # 3) fallback: regex
     def tok(text):
         return re.findall(r"[가-힣A-Za-z0-9]{2,}", text)
     return "simple", tok
@@ -145,7 +117,7 @@ def tokenize_and_join(text: str, stopwords:set) -> str:
         toks = [t for t in toks if t not in stopwords]
     return " ".join(toks)
 
-# ============= neg/pos 보너스 (스크립트 동일) =============
+# ---------- neg/pos 열가중 ----------
 def apply_column_scaling_csc(X_csc, vocab: dict, terms: list, scale: float):
     hits = [vocab[t] for t in terms if t in vocab]
     for j in hits:
@@ -177,47 +149,71 @@ def maybe_apply_negpos_bonus(X_csr, vec, base_dir: Path):
         return X_csr
     return X_csr
 
-# ============= 모델 로드 (스크립트와 동일 정책) =============
-@st.cache_resource(show_spinner=True)
-def load_assets():
-    # SGD (설명용) 있으면 로드
-    cls = None
-    if HAS_SKOPS and (MODELS / "sgd_logistic_cls.skops").exists():
-        cls = safe_skops_load(MODELS / "sgd_logistic_cls.skops")
-    elif (MODELS / "sgd_logistic_cls.joblib").exists():
-        cls = joblib.load(MODELS / "sgd_logistic_cls.joblib")
+# ---------- 자산 로드 ----------
+def load_vectorizer_with_compat(base: Path, model_expected_n: int | None):
+    cands = []
+    sk = base / "tfidf_vectorizer.skops"
+    pk = base / "tfidf_vectorizer.pkl"
+    if sk.exists() and HAS_SKOPS:
+        cands.append(("skops", sk))
+    if pk.exists():
+        cands.append(("pkl", pk))
+    if not cands:
+        raise FileNotFoundError("tfidf_vectorizer.(skops|pkl) 없음")
+
+    last_err, chosen = None, None
+    for kind, path in cands:
+        try:
+            vec = safe_skops_load(path) if kind == "skops" else joblib.load(path)
+            n_vec = len(vec.get_feature_names_out())
+            if (model_expected_n is None) or (n_vec == model_expected_n):
+                chosen = vec
+                break
+            else:
+                last_err = f"{path.name} features {n_vec} != expected {model_expected_n}"
+        except Exception as e:
+            last_err = f"load {path.name} failed: {e!r}"
+    if chosen is None:
+        raise ValueError(f"적합한 TF-IDF 벡터라이저를 찾지 못함: {last_err}")
+    return chosen
+
+def load_assets(base_dir: Path):
+    base = Path(base_dir)
+    # SGD (설명용)
+    if HAS_SKOPS and (base / "sgd_logistic_cls.skops").exists():
+        cls = safe_skops_load(base / "sgd_logistic_cls.skops")
+    elif (base / "sgd_logistic_cls.joblib").exists():
+        cls = joblib.load(base / "sgd_logistic_cls.joblib")
     else:
         cls = None
-    n_exp_cls = getattr(cls, "n_features_in_", None) if cls is not None else None
+    model_expected_n_cls = getattr(cls, "n_features_in_", None) if cls is not None else None
 
     # RF
-    if HAS_SKOPS and (MODELS / "rf_reg.skops").exists():
-        reg = safe_skops_load(MODELS / "rf_reg.skops")
-    elif (MODELS / "rf_reg.joblib").exists():
-        reg = joblib.load(MODELS / "rf_reg.joblib")
+    if HAS_SKOPS and (base / "rf_reg.skops").exists():
+        reg = safe_skops_load(base / "rf_reg.skops")
+    elif (base / "rf_reg.joblib").exists():
+        reg = joblib.load(base / "rf_reg.joblib")
     else:
         raise FileNotFoundError("rf_reg.(skops|joblib) 없음")
-    reg = _patch_rf_monotonic(reg)
-    n_exp_reg = getattr(reg, "n_features_in_", None)
+    reg = patch_rf_monotonic(reg)
+    model_expected_n_reg = getattr(reg, "n_features_in_", None)
 
-    # Vectorizer (cls 기준으로 우선 맞추고, 불일치 시 에러)
-    vec = load_vectorizer_with_compat(MODELS, n_exp_cls)
+    # Vectorizer: (가능하면) SGD 기준으로 맞추되, RF와도 일치 확인
+    vec = load_vectorizer_with_compat(base, model_expected_n_cls or model_expected_n_reg)
     n_vec = len(vec.get_feature_names_out())
-    if (n_exp_reg is not None) and (n_vec != n_exp_reg):
-        raise ValueError(f"벡터라이저({n_vec}) != RF 기대({n_exp_reg})")
+    if (model_expected_n_reg is not None) and (n_vec != model_expected_n_reg):
+        raise ValueError(f"벡터라이저 피처수 {n_vec} != RF 기대 {model_expected_n_reg}")
 
-    # stopwords
+    # 불용어
     stop = set()
-    for sw in [MODELS.parent / "stopwords_ko.txt", MODELS / "stopwords_ko.txt"]:
-        if Path(sw).exists():
-            stop = {x.strip() for x in Path(sw).read_text(encoding="utf-8").splitlines() if x.strip()}
+    for sw in [base.parent / "stopwords_ko.txt", base / "stopwords_ko.txt"]:
+        if sw.exists():
+            stop = {x.strip() for x in sw.read_text(encoding="utf-8").splitlines() if x.strip()}
             break
 
-    return vec, reg, cls, stop
+    return vec, reg, cls, stop, base
 
-vec, reg, sgd, stopwords = load_assets()
-
-# ============= 위험도 =============
+# ---------- 위험도 ----------
 def risk_level(avg_score: float) -> str:
     if avg_score >= 4.10: return "Safe"
     if avg_score >= 4.00: return "Low"
@@ -225,69 +221,70 @@ def risk_level(avg_score: float) -> str:
     return "High"
 
 def risk_color(level: str) -> str:
-    return {"Safe": "#2e7d32","Low": "#558b2f","Medium": "#f9a825","High": "#c62828"}.get(level, "#333")
+    return {"Safe":"#2e7d32","Low":"#558b2f","Medium":"#f9a825","High":"#c62828"}.get(level, "#333")
 
-# ============= SGD 기여도(부정 TOP3 집계) =============
-def negative_top3_across_rows(X: csr_matrix, vec, sgd, tfidf_min=0.10, k=3):
-    """
-    5점(가장 긍정) 클래스의 계수 기준으로 contrib=coef*tfidf가 음수인 토큰들만 합산,
-    전체 행에 대해 누적 후 가장 마이너스가 큰 3개 반환.
-    """
-    if (sgd is None) or (not hasattr(sgd, "coef_")):
+# ---------- 부정적 토큰(상위3) : (coef5 - coef1) * tfidf 가장 음수 ----------
+def negative_top_terms(vec, cls, Xrow: csr_matrix, topk=3):
+    if cls is None or not hasattr(cls, "coef_"):  # SGD 없으면 불가
         return []
-    feats = np.asarray(vec.get_feature_names_out())
-    classes = getattr(sgd, "classes_", None)
-    if classes is None:
-        idx5 = sgd.coef_.shape[0]-1
-    else:
-        idx_arr = np.where(classes == 5)[0]
-        idx5 = int(idx_arr[0]) if len(idx_arr) else sgd.coef_.shape[0]-1
-    coef = sgd.coef_[idx5]
-    contrib_sum = defaultdict(float)
-
-    # 행 단위 누적
-    for i in range(X.shape[0]):
-        row = X[i].toarray().ravel()
-        mask = (row >= tfidf_min)
-        if not np.any(mask): 
+    feats = vec.get_feature_names_out()
+    coef = cls.coef_       # shape: [n_classes, n_features]
+    classes = getattr(cls, "classes_", np.arange(coef.shape[0]))
+    # class 1과 class 5 인덱스 찾기
+    def find_idx(c):
+        idx = np.where(classes == c)[0]
+        return int(idx[0]) if len(idx) else None
+    i1, i5 = find_idx(1), find_idx(5)
+    if i1 is None or i5 is None:
+        return []
+    delta = coef[i5] - coef[i1]   # 양수면 별5 쪽, 음수면 별1 쪽
+    x = Xrow.toarray().ravel()
+    contrib = delta * x
+    # 음수(하락) 기여가 큰 순서
+    idx = np.argsort(contrib)[:topk]
+    rows = []
+    for j in idx:
+        if x[j] == 0: 
             continue
-        contrib = coef[mask] * row[mask]
-        # 음수만
-        neg_idx = np.where(contrib < 0)[0]
-        for local_j in neg_idx:
-            j = np.where(mask)[0][local_j]
-            contrib_sum[int(j)] += float(contrib[local_j])
+        rows.append({"term": str(feats[j]), "tfidf": float(x[j]), "coef_delta": float(delta[j]), "score_pull": float(contrib[j])})
+    return rows
 
-    if not contrib_sum:
-        return []
-    # 가장 마이너스(작은 값) 3개
-    items = sorted(contrib_sum.items(), key=lambda x: x[1])[:k]
-    return [(feats[j], v) for j, v in items]
+# ---------- Streamlit UI ----------
+st.set_page_config(page_title="리뷰 예측/분석", page_icon="⭐", layout="wide")
+ROOT = Path(__file__).resolve().parent
+MODELS = ROOT / "models"
 
-# ============= UI: 단일 예측 =============
+st.title("⭐ 리뷰 예측 데모 (safe-동일화)")
+
+# 경로 입력(고정 경로 쓰면 수정)
+base_dir = MODELS
+vec, reg, cls, stop, base = load_assets(base_dir)
+
+with st.expander("디버그(모델/벡터라이저 일치 확인)"):
+    st.write({
+        "tokenizer": TOK_NAME,
+        "stopwords": len(stop),
+        "vectorizer_features": len(vec.get_feature_names_out()),
+        "rf_n_features_in_": getattr(reg, "n_features_in_", None),
+        "sgd_n_features_in_": getattr(cls, "n_features_in_", None) if cls is not None else None,
+        "negpos_summary": (base / "tfidf_summary.json").exists()
+    })
+
+sgd_explain = st.toggle("SGD 기반 설명(부정 토큰) 표시", value=True, help="SGD가 있을 때만 표시")
+
+# 단일 예측
 st.subheader("단일 텍스트 예측")
-colA, colB = st.columns([3,1])
-with colA:
-    inp = st.text_area("리뷰 텍스트 입력", height=140, placeholder="리뷰를 붙여넣으세요…")
-with colB:
-    show_sgd = st.toggle("설명 사용(부정 단어)", value=True, help="부정 단어 TOP3를 계산")
-
+inp = st.text_area("리뷰 텍스트 입력", height=160, placeholder="리뷰를 붙여넣으세요…")
 if st.button("예측하기") and inp.strip():
-    toks = tokenize_and_join(inp, stopwords)
+    toks = tokenize_and_join(inp, stop)
     X = vec.transform([toks])
-    X = maybe_apply_negpos_bonus(X, vec, MODELS)
+    X = maybe_apply_negpos_bonus(X, vec, base)
     score = float(np.clip(reg.predict(X)[0], 1, 5))
     st.metric("예측 점수", f"{score:.2f} ★")
 
-    if show_sgd:
-        neg_top3 = negative_top3_across_rows(X, vec, sgd, tfidf_min=0.10, k=3)
-        if neg_top3:
-            parts = [f"{w} (Σ {v:.2f})" for w, v in neg_top3]
-            st.markdown(f"**리뷰 속 부정적 단어 TOP3:** " + ", ".join(parts))
-
 st.divider()
 
-# ============= UI: 배치 예측 =============
+# 배치 예측
 st.subheader("배치 예측 (CSV 업로드)")
 csv = st.file_uploader("CSV 업로드 (필수 컬럼: review_text)", type=["csv"])
 
@@ -296,51 +293,67 @@ if csv is not None:
         df = pd.read_csv(csv)
     except Exception as e:
         st.error(f"CSV 로딩 실패: {e}")
-    else:
-        if "review_text" not in df.columns:
-            st.error("CSV에 'review_text' 컬럼이 없습니다.")
-        else:
-            texts = df["review_text"].fillna("").astype(str).tolist()
-            toks  = [tokenize_and_join(t, stopwords) for t in texts]
-            X     = vec.transform(toks)
-            X     = maybe_apply_negpos_bonus(X, vec, MODELS)
+        st.stop()
 
-            pred  = np.clip(reg.predict(X), 1, 5)
-            df_out = df.copy()
-            df_out["예측 별점"] = np.round(pred, 2)
+    if "review_text" not in df.columns:
+        st.error("CSV에 'review_text' 컬럼이 없습니다.")
+        st.stop()
 
-            # 표
-            view_cols = []
-            if "review_text" in df_out.columns: view_cols.append("review_text")
-            if "review_date" in df_out.columns: view_cols.append("review_date")
-            view_cols.append("예측 별점")
-            st.dataframe(df_out.loc[:, view_cols].rename(columns={
-                "review_text":"리뷰","review_date":"날짜"
-            }), use_container_width=True)
+    texts = df["review_text"].fillna("").astype(str).tolist()
+    toks = [tokenize_and_join(t, stop) for t in texts]
+    X = vec.transform(toks)
+    X = maybe_apply_negpos_bonus(X, vec, base)
 
-            # 평균/위험도
-            avg = float(np.round(pred.mean(), 2))
-            level = risk_level(avg)
-            c1, c2 = st.columns([1,1])
-            with c1:
-                st.metric("평균 평점", f"{avg:.2f} ★")
-            with c2:
-                st.markdown(
-                    f"""<div style="padding:10px 12px;border-radius:10px;background:{risk_color(level)};color:#fff;display:inline-block;font-weight:600;">위험도: {level}</div>""",
-                    unsafe_allow_html=True,
-                )
+    pred = np.clip(reg.predict(X), 1, 5)
+    df_out = df.copy()
+    df_out["pred_score"] = np.round(pred, 2)
 
-            # 부정 TOP3 (High/Medium일 때만)
-            if level in ("High","Medium") and show_sgd:
-                neg_top3 = negative_top3_across_rows(X, vec, sgd, tfidf_min=0.10, k=3)
-                if neg_top3:
-                    parts = [f"{w} (Σ {v:.2f})" for w, v in neg_top3]
-                    st.markdown(f"**리뷰 속 부정적 단어 TOP3:** " + ", ".join(parts))
+    # 화면용 표
+    view_cols = [c for c in ("review_text","review_date") if c in df_out.columns] + ["pred_score"]
+    st.dataframe(df_out.loc[:, view_cols].rename(columns={"review_text":"리뷰","review_date":"날짜","pred_score":"예측 별점"}), use_container_width=True)
 
-            # 다운로드
-            st.download_button(
-                "결과 CSV 다운로드",
-                df_out.to_csv(index=False, encoding="utf-8-sig"),
-                file_name="predictions.csv",
-                mime="text/csv",
-            )
+    # 평균/위험도
+    avg = float(df_out["pred_score"].mean())
+    level = risk_level(avg)
+    c1,c2 = st.columns([1,1])
+    with c1:
+        st.metric("평균 평점", f"{avg:.2f} ★")
+    with c2:
+        st.markdown(f"""
+        <div style="padding:10px 12px;border-radius:10px;background:{risk_color(level)};color:#fff;display:inline-block;font-weight:600;">
+            위험도: {level}
+        </div>""", unsafe_allow_html=True)
+
+    # 부정 토큰 TOP3 (High/Medium && SGD on)
+    if sgd_explain and level in {"High","Medium"} and cls is not None:
+        # 전체 문서의 부정 기여 합을 토큰별로 누적하여 TOP3
+        feats = vec.get_feature_names_out()
+        agg = {}
+        # (coef5 - coef1) * tfidf 음수 방향 합
+        coef = cls.coef_
+        classes = getattr(cls, "classes_", np.arange(coef.shape[0]))
+        i1 = np.where(classes == 1)[0]
+        i5 = np.where(classes == 5)[0]
+        if len(i1) and len(i5):
+            delta = coef[int(i5[0])] - coef[int(i1[0])]
+            for i in range(X.shape[0]):
+                row = X[i].toarray().ravel()
+                contrib = delta * row
+                # 음수(하락)만 누적
+                neg_idx = np.where(contrib < 0)[0]
+                for j in neg_idx:
+                    if row[j] == 0: 
+                        continue
+                    agg[j] = agg.get(j, 0.0) + contrib[j]
+            if agg:
+                worst = sorted(agg.items(), key=lambda kv: kv[1])[:3]
+                labels = [f"{feats[j]} (Σ {aggv:.2f})" for j, aggv in worst]
+                st.markdown(f"**리뷰 속 부정적 단어 TOP3:** " + ", ".join(labels))
+
+    # 다운로드
+    st.download_button(
+        "결과 CSV 다운로드",
+        df_out.to_csv(index=False, encoding="utf-8-sig"),
+        file_name="predictions.csv",
+        mime="text/csv",
+    )
