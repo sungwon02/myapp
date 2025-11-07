@@ -335,7 +335,7 @@ def worst_tokens_from_batch_by_margin(X, vec, cls, stopwords: set[str], topk=3):
             if len(cleaned) >= topk:
                 break
 
-    labels = [f"{tok} (Σ {val:.2f})" for tok, val in cleaned]
+    labels = [f"{tok}" for tok, val in cleaned]
     return labels
 
 
