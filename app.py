@@ -243,14 +243,14 @@ def risk_color(level: str) -> str:
 
 
 # =========================
-# 부정 토큰 TOP3 (네가 말한 방식)
+# 부정 토큰 TOP3 (네가 말한 방식 + 화이트리스트)
 # =========================
-def worst_tokens_from_batch_by_margin(X, vec, cls, topk=3):
+def worst_tokens_from_batch_by_margin(X, vec, cls, stopwords: set[str], topk=3):
     """
     X: (n_samples, n_features) sparse
-    vec: vectorizer (get_feature_names_out)
-    cls: SGDClassifier (OvR)
-    return: list[str]  e.g. ["많이 (Σ -0.64)", "그런지 (Σ -0.43)", ...]
+    vec: vectorizer
+    cls: SGDClassifier
+    stopwords: 우리가 읽어온 불용어 세트
     """
     if cls is None or not hasattr(cls, "coef_"):
         return []
@@ -259,7 +259,7 @@ def worst_tokens_from_batch_by_margin(X, vec, cls, topk=3):
     coef = cls.coef_
     classes = getattr(cls, "classes_", np.arange(coef.shape[0]))
 
-    # 1점 인덱스, 5점 인덱스 찾기
+    # 1점 / 5점 계수 찾기
     i1 = np.where(classes == 1)[0]
     i5 = np.where(classes == 5)[0]
     if not len(i1) or not len(i5):
@@ -267,9 +267,28 @@ def worst_tokens_from_batch_by_margin(X, vec, cls, topk=3):
 
     w1 = coef[int(i1[0])]
     w5 = coef[int(i5[0])]
-    delta = w5 - w1  # 네가 말한 (coef5 - coef1)
+    delta = w5 - w1  # (coef5 - coef1)
 
-    # 전체 리뷰에 대해 누적
+    # ── 여기 추가된 화이트리스트 ──
+    DISPLAY_WHITELIST = {
+        # 서비스/응대
+        "서비스", "불친절", "친절", "응대", "직원", "사장", "사장님",
+        # 가격/가성비
+        "가격", "비싸", "저렴", "가성비", "할인",
+        # 위생/청결/이물질
+        "위생", "청결", "더럽", "더러", "깨끗", "깔끔", "냄새", "벌레", "머리카락", "이물질",
+        # 대기/접근성
+        "대기", "웨이팅", "줄", "주차", "자리",
+        # 맛/품질
+        "맛", "맛있", "맛없", "신선", "퀄리티", "식감",
+        # 양/구성
+        "양", "구성", "창렬",
+        # 분위기
+        "분위기", "시끄럽", "조용", "공간", "인테리어",
+        # 기타 부정
+        "별로", "최악", "불편", "아쉬움", "아쉬운", "오래", "느림",
+    }
+
     agg = {}
     for i in range(X.shape[0]):
         row = X[i].toarray().ravel()
@@ -283,9 +302,40 @@ def worst_tokens_from_batch_by_margin(X, vec, cls, topk=3):
     if not agg:
         return []
 
-    # 가장 많이 깎은 애 3개 (가장 음수인 것부터)
-    worst = sorted(agg.items(), key=lambda kv: kv[1])[:topk]
-    labels = [f"{feats[j]}" for j, val in worst]
+    sorted_items = sorted(agg.items(), key=lambda kv: kv[1])  # 가장 음수부터
+
+    cleaned = []
+    for j, val in sorted_items:
+        tok = feats[j]
+
+        # 우선 불용어/한글자/숫자기호 거르기
+        if tok in stopwords:
+            continue
+        if len(tok) < 2:
+            continue
+        if re.fullmatch(r"[0-9\W_]+", tok):
+            continue
+
+        # 화이트리스트 안에 있으면 바로 후보
+        if tok in DISPLAY_WHITELIST:
+            cleaned.append((tok, val))
+
+        if len(cleaned) >= topk:
+            break
+
+    # 화이트리스트로 3개를 못 채웠으면 남은 것들에서 그냥 채움
+    if len(cleaned) < topk:
+        for j, val in sorted_items:
+            tok = feats[j]
+            if tok in stopwords or len(tok) < 2:
+                continue
+            if (tok, val) in cleaned:
+                continue
+            cleaned.append((tok, val))
+            if len(cleaned) >= topk:
+                break
+
+    labels = [f"{tok} (Σ {val:.2f})" for tok, val in cleaned]
     return labels
 
 
@@ -364,11 +414,8 @@ if csv is not None:
             # 부정 토큰 TOP3
             if level in {"High", "Medium"}:
                 if cls is not None:
-                    worst3 = worst_tokens_from_batch_by_margin(Xb, vec, cls, topk=3)
-                    if worst3:
-                        st.markdown("**리뷰 속 부정적 단어 TOP3:** " + ", ".join(worst3))
-                    else:
-                        st.markdown("**리뷰 속 부정적 단어 TOP3:** (해당 없음)")
+                    worst3 = worst_tokens_from_batch_by_margin(Xb, vec, cls, stopwords, topk=3)
+                    st.markdown("**리뷰 속 부정적 단어 TOP3:** " + ", ".join(worst3))
                 else:
                     st.markdown("**리뷰 속 부정적 단어 TOP3:** 분류 모델이 없어 표시할 수 없습니다.")
 
