@@ -308,7 +308,7 @@ def worst_tokens_from_batch_by_margin(X, vec, cls, stopwords: set[str], topk=3):
 
     sorted_items = sorted(agg.items(), key=lambda kv: kv[1])  # 가장 음수부터
 
-    cleaned = []
+    cleaned: list[tuple[str, float]] = []
     for j, val in sorted_items:
         tok = feats[j]
 
@@ -328,7 +328,7 @@ def worst_tokens_from_batch_by_margin(X, vec, cls, stopwords: set[str], topk=3):
             break
 
     # 화이트리스트로 3개를 못 채웠으면 남은 것들에서 그냥 채움
-        if len(cleaned) < topk:
+    if len(cleaned) < topk:
         for j, val in sorted_items:
             tok = feats[j]
             # 여기서도 블랙리스트 제거
