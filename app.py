@@ -289,7 +289,7 @@ def worst_tokens_from_batch_by_margin(X, vec, cls, stopwords: set[str], topk=3):
         "오래", "느림"
     }
     
-     BLOCKLIST = {
+    BLOCKLIST = {
         "다시","진짜","정말","아쉽",
     }
 
