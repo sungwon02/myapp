@@ -274,7 +274,7 @@ def worst_tokens_from_batch_by_margin(X, vec, cls, stopwords: set[str], topk=3):
         # 서비스/응대
         "서비스", "불친절", "친절", "응대", "직원", "사장", "사장님",
         # 가격/가성비
-        "가격", "비싸", "저렴", "가성비", "할인",
+        "비싸", "저렴", "가성비", "할인",
         # 위생/청결/이물질
         "위생", "청결", "더럽", "더러", "깨끗", "깔끔", "냄새", "벌레", "머리카락", "이물질",
         # 대기/접근성
@@ -290,7 +290,7 @@ def worst_tokens_from_batch_by_margin(X, vec, cls, stopwords: set[str], topk=3):
     }
     
     BLOCKLIST = {
-        "다시","진짜","정말","아쉽",
+        "다시","진짜","정말","아쉽","가격"
     }
 
     agg = {}
