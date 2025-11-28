@@ -286,7 +286,11 @@ def worst_tokens_from_batch_by_margin(X, vec, cls, stopwords: set[str], topk=3):
         # 분위기
         "분위기", "시끄럽","공간", "인테리어",
         # 기타 부정
-        "오래", "느림",
+        "오래", "느림"
+    }
+    
+     BLOCKLIST = {
+        "다시","진짜","정말"
     }
 
     agg = {}
@@ -308,8 +312,8 @@ def worst_tokens_from_batch_by_margin(X, vec, cls, stopwords: set[str], topk=3):
     for j, val in sorted_items:
         tok = feats[j]
 
-        # 우선 불용어/한글자/숫자기호 거르기
-        if tok in stopwords:
+        # 우선 불용어 / 블랙리스트 / 한글자 / 숫자·기호 제거
+        if tok in stopwords or tok in BLOCKLIST:
             continue
         if len(tok) < 2:
             continue
@@ -324,10 +328,13 @@ def worst_tokens_from_batch_by_margin(X, vec, cls, stopwords: set[str], topk=3):
             break
 
     # 화이트리스트로 3개를 못 채웠으면 남은 것들에서 그냥 채움
-    if len(cleaned) < topk:
+        if len(cleaned) < topk:
         for j, val in sorted_items:
             tok = feats[j]
-            if tok in stopwords or len(tok) < 2:
+            # 여기서도 블랙리스트 제거
+            if tok in stopwords or tok in BLOCKLIST or len(tok) < 2:
+                continue
+            if re.fullmatch(r"[0-9\W_]+", tok):
                 continue
             if (tok, val) in cleaned:
                 continue
